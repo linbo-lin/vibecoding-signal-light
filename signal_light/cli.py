@@ -6,22 +6,26 @@ import argparse
 import json
 import os
 import sys
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from signal_light.agent_signals import SIGNALS, AgentSignal, Frame
 from signal_light.hardware import LightMapping, SignalLight, SignalLightError
 from signal_light.runtime import (
-    IDLE_SLEEP_SIGNAL,
-    SESSION_END_NOTICE_SIGNAL,
-    apply_session_signal,
-    apply_signal,
-    clear_session_state,
-    read_session_snapshot,
-    run_worker,
+    read_display_snapshot,
+    run_server,
+    submit_direct_signal,
+    submit_session_signal,
 )
 
 
 HOOK_CONTROL_SIGNALS = {"turn_end"}
+HOOK_OWNER_PID_PAYLOAD_KEYS = ("owner_pid", "session_pid", "agent_pid", "process_pid")
+HOOK_OWNER_PID_ENV_KEYS = (
+    "SIGNAL_LIGHT_OWNER_PID",
+    "CODEX_OWNER_PID",
+    "CLAUDE_CODE_OWNER_PID",
+    "CLAUDE_OWNER_PID",
+)
 
 
 class DryRunLight:
@@ -49,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     play.add_argument("--quiet", action="store_true", help="suppress non-error output")
 
     subparsers.add_parser("list", help="list available lamp-language signals")
-    subparsers.add_parser("status", help="show aggregated Codex session signal state")
+    subparsers.add_parser("status", help="show current server display and session state")
 
     install_hooks = subparsers.add_parser("install-hooks", help="install or repair local agent hooks")
     install_hooks.add_argument(
@@ -72,19 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     cc_hook.add_argument("--event", dest="event_option", help="Claude Code hook event name")
     cc_hook.add_argument("--dry-run", action="store_true", help="print GPIO states instead of touching hardware")
 
-    worker = subparsers.add_parser("worker", help=argparse.SUPPRESS)
-    worker.add_argument(
-        "signal",
-        choices=sorted(
-            {
-                *(name for name, signal in SIGNALS.items() if signal.repeat),
-                SESSION_END_NOTICE_SIGNAL,
-                IDLE_SLEEP_SIGNAL,
-            }
-        ),
-    )
-    worker.add_argument("--owner-token", help=argparse.SUPPRESS)
-    worker.add_argument("--speed", type=float, default=1.0)
+    subparsers.add_parser("server", help=argparse.SUPPRESS)
 
     test = subparsers.add_parser("test", help="run a quick red/yellow/green hardware test")
     test.add_argument("--dry-run", action="store_true", help="print GPIO states instead of touching hardware")
@@ -121,7 +113,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         hook_input = read_codex_hook_input(hook_argv, sys.stdin.read(), os.environ)
         signal = choose_signal(hook_input)
         key = session_key(hook_input, os.environ)
-        return play_hook_signal(signal, session_key=key, dry_run=args.dry_run, quiet=True)
+        owner_pid = resolve_hook_owner_pid(hook_input.payload, os.environ)
+        return play_hook_signal(signal, session_key=key, owner_pid=owner_pid, dry_run=args.dry_run, quiet=True)
     if args.command == "claude-code-hook":
         event = args.event_option or args.event
         from signal_light.claude_code_hook import choose_signal as cc_choose_signal
@@ -131,15 +124,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         hook_input = read_hook_input(hook_argv, sys.stdin.read())
         signal = cc_choose_signal(hook_input)
         key = cc_session_key(hook_input, os.environ)
-        return play_hook_signal(signal, session_key=key, dry_run=args.dry_run, quiet=True)
+        owner_pid = resolve_hook_owner_pid(hook_input.payload, os.environ)
+        return play_hook_signal(signal, session_key=key, owner_pid=owner_pid, dry_run=args.dry_run, quiet=True)
     if args.command == "status":
-        print(json.dumps(read_session_snapshot(), ensure_ascii=False, indent=2))
+        print(json.dumps(read_display_snapshot(), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "server":
+        return run_server()
     if args.command == "test":
         return run_test(dry_run=args.dry_run)
-    if args.command == "worker":
-        return run_worker(args.signal, speed=args.speed)
-
     parser.print_help()
     return 2
 
@@ -168,9 +161,7 @@ def play_signal(signal_name: str, *, dry_run: bool = False, speed: float = 1.0, 
             else:
                 signal.play(DryRunLight(), speed=speed)
         else:
-            if signal.name in {"idle", "off"}:
-                clear_session_state()
-            apply_signal(signal, speed=speed)
+            submit_direct_signal(signal.name, speed=speed)
     except SignalLightError as exc:
         if not quiet:
             print(str(exc), file=sys.stderr)
@@ -183,6 +174,7 @@ def play_hook_signal(
     signal_name: str,
     *,
     session_key: str,
+    owner_pid: int | None = None,
     dry_run: bool = False,
     speed: float = 1.0,
     quiet: bool = False,
@@ -205,7 +197,13 @@ def play_hook_signal(
         return 0
 
     try:
-        aggregate = apply_session_signal(session_key, signal_name, speed=speed)
+        response = submit_session_signal(
+            session_key,
+            signal_name,
+            owner_pid=owner_pid,
+            speed=speed,
+        )
+        aggregate = str(response.get("aggregate", "idle"))
     except SignalLightError as exc:
         if not quiet:
             print(str(exc), file=sys.stderr)
@@ -214,6 +212,32 @@ def play_hook_signal(
     if not quiet:
         print(f"Session {session_key}: {signal_name}; aggregate={aggregate}")
     return 0
+
+
+def resolve_hook_owner_pid(payload: Mapping[str, Any], environ: Mapping[str, str]) -> int | None:
+    """Return an explicitly supplied session owner PID, if the hook provides one."""
+    for key in HOOK_OWNER_PID_PAYLOAD_KEYS:
+        pid = _coerce_owner_pid(payload.get(key))
+        if pid is not None:
+            return pid
+
+    for key in HOOK_OWNER_PID_ENV_KEYS:
+        pid = _coerce_owner_pid(environ.get(key))
+        if pid is not None:
+            return pid
+
+    return None
+
+
+def _coerce_owner_pid(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        pid = int(value.strip())
+        return pid if pid > 0 else None
+    return None
 
 
 def _preview_repeating_signal(signal: AgentSignal, *, speed: float) -> None:

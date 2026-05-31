@@ -101,11 +101,12 @@ def main() -> int:
     signal = choose_signal(hook_input)
     key = session_key(hook_input, os.environ)
 
-    from signal_light.cli import play_hook_signal
+    from signal_light.cli import play_hook_signal, resolve_hook_owner_pid
 
     return play_hook_signal(
         signal_name=signal,
         session_key=key,
+        owner_pid=resolve_hook_owner_pid(hook_input.payload, os.environ),
         dry_run=os.environ.get("SIGNAL_LIGHT_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"},
         quiet=True,
     )

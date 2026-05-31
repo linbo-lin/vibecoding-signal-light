@@ -167,7 +167,7 @@ The work cycle avoids software PWM on plain GPIO hardware, because USB GPIO timi
 - Claude Code hook adapter.
 - Session-aware aggregation for multiple concurrent agent sessions.
 - Red and yellow alerts are never hidden by another session starting work.
-- Background worker keeps animations persistent while hooks return quickly.
+- Local display server keeps animations persistent while hooks return quickly.
 - Dry-run mode for testing without hardware.
 - Environment-based GPIO mapping for custom builds.
 
@@ -176,7 +176,7 @@ The work cycle avoids software PWM on plain GPIO hardware, because USB GPIO timi
 - 支持 Claude Code hook。
 - 支持多个 Agent 会话并发时的状态聚合。
 - 红灯/黄灯告警不会被另一个会话的工作态覆盖。
-- 后台 worker 保持灯效持续运行，hook 本身快速返回。
+- 本地显示 server 保持灯效持续运行，hook 本身快速返回。
 - 支持无硬件 dry-run 预览。
 - 支持通过环境变量调整 GPIO 接线。
 
@@ -234,6 +234,8 @@ The easiest way to install or repair local hooks is the built-in wizard:
 
 The wizard detects supported local agents, validates the current hook files, creates timestamped backups, and installs only the Signal Light hook entries while keeping other hooks on the same events.
 
+The first hook or `play` command auto-starts a local Signal Light server process. That server owns the shared display state, the per-session state, and the animation loop, keeping the single physical lamp in sync for all local agent clients. `status` reports both the session aggregate and the actual `display_signal` currently owned by the server.
+
 安装或修复本地 hook 最简单的方式是内置向导：
 
 ```bash
@@ -262,8 +264,8 @@ Recommended hook mapping:
 | `PreToolUse` | Working cycle |
 | `PostToolUse` | Working cycle |
 | `PermissionRequest` | Red flashing |
-| `Stop` | Clear normal working state |
-| `SessionEnd` | Brief green completion blink, then current aggregate state |
+| `Stop` | Green completion cue, then aggregate state without that session's normal work |
+| `SessionEnd` | Session cleanup; if still tracked, brief green completion blink, then current aggregate state |
 
 See [docs/LAMP_LANGUAGE.md](docs/LAMP_LANGUAGE.md) for a complete `~/.codex/hooks.json` example.
 
@@ -285,8 +287,8 @@ Codex hook 可以直接把事件名传给 wrapper：
 | `PreToolUse` | 工作循环 |
 | `PostToolUse` | 工作循环 |
 | `PermissionRequest` | 红灯闪烁 |
-| `Stop` | 清理普通工作态 |
-| `SessionEnd` | 绿灯短闪提示完成，然后恢复当前聚合状态 |
+| `Stop` | 绿灯提示完成，然后恢复去掉该会话普通工作态后的聚合状态 |
+| `SessionEnd` | 会话清理；如果该会话仍被跟踪，则绿灯短闪提示完成，然后恢复当前聚合状态 |
 
 完整 `~/.codex/hooks.json` 示例见 [docs/LAMP_LANGUAGE.md](docs/LAMP_LANGUAGE.md)。
 
@@ -311,8 +313,8 @@ Supported Claude Code events include:
 | `PostToolUseFailure` | Red flashing |
 | `Notification` | Yellow flashing |
 | `PermissionRequest` | Red flashing |
-| `Stop` | Clear normal working state |
-| `SessionEnd` | Brief green completion blink, then current aggregate state |
+| `Stop` | Green completion cue, then aggregate state without that session's normal work |
+| `SessionEnd` | Session cleanup; if still tracked, brief green completion blink, then current aggregate state |
 
 Claude Code 会通过 stdin 传入 JSON hook 数据，因此 wrapper 通常不需要额外参数：
 
@@ -333,8 +335,8 @@ echo '{"event":"Notification","session_id":"demo"}' | ./scripts/claude-code-sign
 | `PostToolUseFailure` | 红灯闪烁 |
 | `Notification` | 黄灯闪烁 |
 | `PermissionRequest` | 红灯闪烁 |
-| `Stop` | 清理普通工作态 |
-| `SessionEnd` | 绿灯短闪提示完成，然后恢复当前聚合状态 |
+| `Stop` | 绿灯提示完成，然后恢复去掉该会话普通工作态后的聚合状态 |
+| `SessionEnd` | 会话清理；如果该会话仍被跟踪，则绿灯短闪提示完成，然后恢复当前聚合状态 |
 
 See [docs/LAMP_LANGUAGE.md](docs/LAMP_LANGUAGE.md) for a complete `~/.claude/settings.json` example.
 
@@ -348,9 +350,9 @@ The runtime stores the latest state for each agent session and shows the highest
 red flashing > yellow flashing > working cycle > steady green
 ```
 
-That means one session waiting for permission will stay red even if another session starts working. A normal `Stop` only clears non-urgent working state; it does not erase an existing red alert.
+That means one session waiting for permission will stay red even if another session starts working. A normal `Stop` only clears non-urgent working state; it does not erase an existing red alert. The local server also removes sessions whose recorded owner process has exited, which keeps a killed local run from leaving the lamp stuck in an old working state.
 
-When one tracked session ends while other sessions are still running, the runtime briefly flashes green as a completion cue, then restores the current aggregate state. If all sessions have ended, it settles on steady green. Red or yellow alerts are not interrupted by this completion cue.
+When one tracked turn or session ends while other sessions are still running, the runtime briefly flashes green as a completion cue, then restores the current aggregate state. If all sessions have ended, it settles on steady green. If it remains idle, the light turns fully off after `SIGNAL_LIGHT_IDLE_SLEEP_SECONDS` (10 minutes by default). Red or yellow alerts are not interrupted by this completion cue.
 
 运行时会记录每个 Agent 会话的最新状态，并把最高优先级状态显示到真实信号灯上：
 

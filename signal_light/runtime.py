@@ -4,32 +4,35 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import signal
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
-from hashlib import sha256
 from pathlib import Path
 from typing import Iterator
 
-from signal_light.agent_signals import AgentSignal, SIGNALS
+from signal_light.agent_signals import AgentSignal, Frame, SIGNALS
 from signal_light.hardware import LightMapping, SignalLight, SignalLightError
 
 
 STATE_DIR = Path(os.environ.get("SIGNAL_LIGHT_STATE_DIR", "/private/tmp/signal-light"))
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PID_FILE = STATE_DIR / "worker.json"
-LOG_FILE = STATE_DIR / "worker.log"
-NOTICE_PID_FILE = STATE_DIR / "notice-worker.json"
-NOTICE_LOG_FILE = STATE_DIR / "notice-worker.log"
-SLEEP_PID_FILE = STATE_DIR / "sleep-worker.json"
-SLEEP_LOG_FILE = STATE_DIR / "sleep-worker.log"
+SERVER_PID_FILE = STATE_DIR / "server.json"
+SERVER_LOG_FILE = STATE_DIR / "server.log"
+SERVER_SOCKET_FILE = STATE_DIR / "server.sock"
+SERVER_REQUEST_DIR = STATE_DIR / "requests"
+SERVER_LOCK_FILE = STATE_DIR / "server.lock"
+SERVER_STARTUP_LOCK_FILE = STATE_DIR / "server-startup.lock"
 SESSION_FILE = STATE_DIR / "sessions.json"
 LOCK_FILE = STATE_DIR / "state.lock"
 SESSION_TTL_SECONDS = int(os.environ.get("SIGNAL_LIGHT_SESSION_TTL_SECONDS", "86400"))
+WORK_SESSION_STALE_SECONDS = int(os.environ.get("SIGNAL_LIGHT_WORK_SESSION_STALE_SECONDS", "1800"))
 IDLE_SLEEP_SECONDS = int(os.environ.get("SIGNAL_LIGHT_IDLE_SLEEP_SECONDS", "600"))
+SERVER_POLL_SECONDS = float(os.environ.get("SIGNAL_LIGHT_SERVER_POLL_SECONDS", "1.0"))
+SERVER_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("SIGNAL_LIGHT_SERVER_REQUEST_TIMEOUT_SECONDS", "1.0"))
+SERVER_REQUEST_POLL_SECONDS = float(os.environ.get("SIGNAL_LIGHT_SERVER_REQUEST_POLL_SECONDS", "0.05"))
 
 RED_SIGNALS = {"blocked"}
 YELLOW_SIGNALS = {"permission", "attention", "done"}
@@ -38,131 +41,175 @@ SESSION_END_SIGNALS = {"session_end"}
 # Explicit clears should not look like session-completion cues.
 SESSION_CLEAR_SIGNALS = {"off"}
 SESSION_END_NOTICE_SIGNAL = "session_done"
-IDLE_SLEEP_SIGNAL = "idle_sleep"
 TURN_END_SIGNALS = {"turn_end"}
 # Sessions still waiting for user action should survive turn_end.
 TURN_END_KEEP_SIGNALS = {"permission", "blocked"}
-REPEATING_WORKER_SIGNALS = {name for name, agent_signal in SIGNALS.items() if agent_signal.repeat}
+OWNER_PID_SOURCE = "explicit"
 
 
-def apply_signal(signal: AgentSignal, *, speed: float = 1.0) -> None:
-    """Apply a signal as the current persistent status."""
-    stop_notice_worker()
-    stop_sleep_worker()
-    if signal.repeat:
-        if _worker_matches(signal.name):
+class ServerDisplay:
+    """Single-process renderer for the physical signal light."""
+
+    def __init__(self, light: SignalLight, *, speed: float = 1.0) -> None:
+        self.light = light
+        self.speed = speed
+        self.aggregate = "idle"
+        self.mode = "idle"
+        self.frame_index = 0
+        self.frame_deadline = 0.0
+        self.notice_until = 0.0
+        self.idle_since = time.monotonic()
+
+    def set_aggregate(self, aggregate: str, *, show_notice: bool = False, speed: float | None = None) -> None:
+        if speed is not None:
+            self.speed = speed
+        self.aggregate = aggregate
+        if show_notice and aggregate not in RED_SIGNALS and aggregate not in YELLOW_SIGNALS:
+            self.mode = SESSION_END_NOTICE_SIGNAL
+            self.frame_index = 0
+            self.frame_deadline = 0.0
+            self.notice_until = time.monotonic() + _signal_duration(SIGNALS[SESSION_END_NOTICE_SIGNAL], self.speed)
+        else:
+            self.mode = aggregate
+            self.frame_index = 0
+            self.frame_deadline = 0.0
+            self.notice_until = 0.0
+        if aggregate == "idle" and self.mode == "idle":
+            self.idle_since = time.monotonic()
+
+    def tick(self) -> str | None:
+        now = time.monotonic()
+        if self.mode == SESSION_END_NOTICE_SIGNAL and now >= self.notice_until:
+            self.mode = self.aggregate
+            self.frame_index = 0
+            self.frame_deadline = 0.0
+            if self.aggregate == "idle":
+                self.idle_since = now
+
+        if self.mode == "idle" and now - self.idle_since >= IDLE_SLEEP_SECONDS:
+            self._write_frame(Frame(seconds=0.01))
+            self.mode = "off"
+            self.frame_deadline = 0.0
+            return "idle_sleep"
+
+        signal_to_render = SIGNALS[self.mode]
+        if signal_to_render.repeat or self.mode == SESSION_END_NOTICE_SIGNAL:
+            self._tick_frames(signal_to_render, now)
+            return None
+
+        if self.frame_deadline == 0.0:
+            self._render_steady(signal_to_render)
+            self.frame_deadline = float("inf")
+        return None
+
+    def next_timeout(self) -> float:
+        now = time.monotonic()
+        deadlines = []
+        if self.frame_deadline not in {0.0, float("inf")}:
+            deadlines.append(self.frame_deadline)
+        if self.notice_until:
+            deadlines.append(self.notice_until)
+        if self.mode == "idle":
+            deadlines.append(self.idle_since + IDLE_SLEEP_SECONDS)
+        if not deadlines:
+            return SERVER_POLL_SECONDS
+        return max(0.0, min(SERVER_POLL_SECONDS, min(deadlines) - now))
+
+    def _tick_frames(self, signal_to_render: AgentSignal, now: float) -> None:
+        frames = signal_to_render.frames
+        if not frames:
+            self._render_steady(signal_to_render)
             return
-        stop_worker()
-        start_worker(signal.name, speed=speed)
-        return
-
-    stop_worker()
-    _play_with_retries(signal, speed=speed)
-    if signal.name == "idle":
-        start_sleep_worker()
-
-
-def apply_signal_now(signal: AgentSignal, *, speed: float = 1.0) -> None:
-    """Apply a signal without stopping any in-flight notice worker."""
-    stop_sleep_worker()
-    if signal.repeat:
-        if _worker_matches(signal.name):
+        if self.frame_deadline and now < self.frame_deadline:
             return
-        stop_worker()
-        start_worker(signal.name, speed=speed)
-        return
 
-    stop_worker()
-    _play_with_retries(signal, speed=speed)
-    if signal.name == "idle":
-        start_sleep_worker()
+        frame = frames[self.frame_index % len(frames)]
+        self._write_frame(frame)
+        self.frame_index += 1
+        self.frame_deadline = now + max(frame.seconds * max(self.speed, 0.05), 0.0)
+
+    def _render_steady(self, signal_to_render: AgentSignal) -> None:
+        if signal_to_render.leave_on is None:
+            self.light.off()
+            return
+        green, yellow, red = signal_to_render.leave_on
+        self.light.write(green=green, yellow=yellow, red=red)
+
+    def _write_frame(self, frame: Frame) -> None:
+        if not (frame.green or frame.yellow or frame.red):
+            self.light.off()
+            return
+
+        brightness = max(0.0, min(1.0, frame.brightness))
+        write_brightness = getattr(self.light, "write_brightness", None)
+        if brightness < 1.0 and callable(write_brightness):
+            write_brightness(
+                green=brightness if frame.green else 0.0,
+                yellow=brightness if frame.yellow else 0.0,
+                red=brightness if frame.red else 0.0,
+            )
+            return
+        self.light.write(green=frame.green, yellow=frame.yellow, red=frame.red)
 
 
-def apply_session_signal(session_key: str, signal_name: str, *, speed: float = 1.0) -> str:
-    """Update one Codex session state, then apply the aggregated global state."""
+def update_session_signal(
+    session_key: str,
+    signal_name: str,
+    *,
+    owner_pid: int | None = None,
+) -> dict[str, object]:
+    """Update one session state and return the aggregate without rendering it."""
     with _state_lock():
         state = _read_session_state()
         sessions = state.setdefault("sessions", {})
         now = time.time()
         _prune_sessions(sessions, now)
         should_show_session_end_notice = False
+        direct_override_should_clear = False
 
         if signal_name in SESSION_END_SIGNALS:
-            should_show_session_end_notice = session_key in sessions
+            should_show_session_end_notice = True
+            direct_override_should_clear = True
             sessions.pop(session_key, None)
         elif signal_name in SESSION_CLEAR_SIGNALS:
+            direct_override_should_clear = session_key in sessions
             sessions.pop(session_key, None)
         elif signal_name in TURN_END_SIGNALS:
             current = sessions.get(session_key)
             current_signal = current.get("signal") if isinstance(current, dict) else None
             if current_signal not in TURN_END_KEEP_SIGNALS:
-                should_show_session_end_notice = session_key in sessions
+                should_show_session_end_notice = True
+                direct_override_should_clear = True
                 sessions.pop(session_key, None)
         else:
+            direct_override_should_clear = True
+            current = sessions.get(session_key)
             sessions[session_key] = {
                 "signal": signal_name,
                 "updated_at": now,
             }
+            if isinstance(owner_pid, int) and owner_pid > 0:
+                sessions[session_key]["owner_pid"] = owner_pid
+                sessions[session_key]["owner_pid_source"] = OWNER_PID_SOURCE
+            elif (
+                isinstance(current, dict)
+                and current.get("owner_pid_source") == OWNER_PID_SOURCE
+                and isinstance(current.get("owner_pid"), int)
+                and current["owner_pid"] > 0
+            ):
+                inherited_owner_pid = current["owner_pid"]
+                sessions[session_key]["owner_pid"] = inherited_owner_pid
+                sessions[session_key]["owner_pid_source"] = OWNER_PID_SOURCE
+
+        if direct_override_should_clear:
+            state.pop("direct_signal", None)
 
         aggregate = aggregate_sessions(sessions)
         _write_session_state(state)
-        if should_show_session_end_notice:
-            apply_session_end_notice(aggregate, speed=speed)
-        else:
-            apply_signal(SIGNALS[aggregate], speed=speed)
-        return aggregate
-
-
-def apply_session_end_notice(aggregate: str, *, speed: float = 1.0) -> None:
-    """Briefly acknowledge a completed session, then restore the aggregate state."""
-    if aggregate in RED_SIGNALS or aggregate in YELLOW_SIGNALS:
-        apply_signal(SIGNALS[aggregate], speed=speed)
-        return
-
-    start_notice_worker(speed=speed)
-
-
-def start_notice_worker(*, speed: float = 1.0) -> None:
-    stop_notice_worker()
-    _spawn_worker_process(
-        signal_name=SESSION_END_NOTICE_SIGNAL,
-        speed=speed,
-        pid_file=NOTICE_PID_FILE,
-        log_file=NOTICE_LOG_FILE,
-        verify_startup=False,
-    )
-
-
-def start_sleep_worker() -> None:
-    stop_sleep_worker()
-    _spawn_worker_process(
-        signal_name=IDLE_SLEEP_SIGNAL,
-        speed=1.0,
-        pid_file=SLEEP_PID_FILE,
-        log_file=SLEEP_LOG_FILE,
-        verify_startup=False,
-    )
-
-
-def stop_sleep_worker() -> None:
-    _stop_worker_process(pid_file=SLEEP_PID_FILE, orphan_signal_names={IDLE_SLEEP_SIGNAL})
-
-
-def run_idle_sleep_worker() -> int:
-    """Wait for IDLE_SLEEP_SECONDS, then turn off the lights if still idle."""
-    try:
-        time.sleep(IDLE_SLEEP_SECONDS)
-        with _state_lock():
-            if not _worker_pid_matches(SLEEP_PID_FILE, os.getpid()):
-                return 0
-            snapshot = _read_session_snapshot_unlocked()
-            if snapshot["aggregate"] != "idle":
-                return 0
-            stop_worker()
-            _play_with_retries(SIGNALS["off"], speed=1.0)
-        return 0
-    finally:
-        _clear_worker_pid_file(SLEEP_PID_FILE, expected_pid=os.getpid())
+        return {
+            "aggregate": aggregate,
+            "show_notice": should_show_session_end_notice,
+        }
 
 
 def clear_session_state() -> None:
@@ -195,13 +242,108 @@ def read_session_snapshot() -> dict[str, object]:
         return _read_session_snapshot_unlocked()
 
 
+def update_direct_signal(signal_name: str) -> dict[str, object]:
+    with _state_lock():
+        if signal_name not in SIGNALS:
+            raise SignalLightError(f"Unknown direct signal: {signal_name}")
+        state = _read_session_state()
+        if signal_name in {"idle", "off"}:
+            state["sessions"] = {}
+        state["direct_signal"] = signal_name
+        _write_session_state(state)
+        return _read_display_snapshot_unlocked()
+
+
+def submit_direct_signal(signal_name: str, *, speed: float = 1.0) -> dict[str, object]:
+    return _send_server_request(
+        {
+            "action": "direct_signal",
+            "signal_name": signal_name,
+            "speed": speed,
+        }
+    )
+
+
+def submit_session_signal(
+    session_key: str,
+    signal_name: str,
+    *,
+    owner_pid: int | None = None,
+    speed: float = 1.0,
+) -> dict[str, object]:
+    return _send_server_request(
+        {
+            "action": "session_signal",
+            "session_key": session_key,
+            "signal_name": signal_name,
+            "owner_pid": owner_pid,
+            "speed": speed,
+        }
+    )
+
+
+def run_server() -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with _server_process_lock():
+        try:
+            SERVER_PID_FILE.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "started_at": time.time(),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            with SignalLight(LightMapping.from_env(os.environ)) as light:
+                display = ServerDisplay(light)
+                display.set_aggregate(str(read_display_snapshot()["display_signal"]))
+                _prepare_server_ipc()
+                while True:
+                    reconciled = _reconcile_server_sessions()
+                    if reconciled["changed"]:
+                        display.set_aggregate(str(reconciled["aggregate"]))
+                    if display.tick() == "idle_sleep":
+                        update_direct_signal("off")
+                    _handle_server_requests(display)
+                    time.sleep(min(display.next_timeout(), SERVER_REQUEST_POLL_SECONDS))
+        finally:
+            _clear_pid_file(SERVER_PID_FILE, expected_pid=os.getpid())
+            _clear_server_ipc()
+
+
 def _read_session_snapshot_unlocked() -> dict[str, object]:
     state = _read_session_state()
+    return _read_session_snapshot_from_state(state)
+
+
+def read_display_snapshot() -> dict[str, object]:
+    with _state_lock():
+        return _read_display_snapshot_unlocked()
+
+
+def _read_display_snapshot_unlocked() -> dict[str, object]:
+    state = _read_session_state()
+    return _read_display_snapshot_from_state(state)
+
+
+def _read_display_snapshot_from_state(state: dict[str, object]) -> dict[str, object]:
+    snapshot = _read_session_snapshot_from_state(state)
+    direct_signal = state.get("direct_signal")
+    display_signal = direct_signal if isinstance(direct_signal, str) and direct_signal in SIGNALS else snapshot["aggregate"]
+    return {
+        **snapshot,
+        "display_signal": display_signal,
+    }
+
+
+def _read_session_snapshot_from_state(state: dict[str, object]) -> dict[str, object]:
     sessions = state.get("sessions", {})
     if not isinstance(sessions, dict):
         sessions = {}
     now = time.time()
     _prune_sessions(sessions, now)
+    _prune_dead_owner_sessions(sessions)
     aggregate = aggregate_sessions(sessions)
     return {
         "aggregate": aggregate,
@@ -209,42 +351,8 @@ def _read_session_snapshot_unlocked() -> dict[str, object]:
     }
 
 
-def run_worker(signal_name: str, *, speed: float = 1.0) -> int:
-    if signal_name == SESSION_END_NOTICE_SIGNAL:
-        return run_session_end_notice_worker(speed=speed)
-    if signal_name == IDLE_SLEEP_SIGNAL:
-        return run_idle_sleep_worker()
-
-    signal_to_run = SIGNALS[signal_name]
-    if not signal_to_run.repeat:
-        raise SignalLightError(f"Signal {signal_name} is not a repeating signal.")
-
-    with SignalLight(LightMapping.from_env(os.environ)) as light:
-        signal_to_run.play_forever(light, speed=speed)
-    return 0
-
-
-def run_session_end_notice_worker(*, speed: float = 1.0) -> int:
-    notice_signal = SIGNALS[SESSION_END_NOTICE_SIGNAL]
-    try:
-        stop_worker()
-        try:
-            with SignalLight(LightMapping.from_env(os.environ)) as light:
-                notice_signal.play(light, speed=speed)
-        finally:
-            _restore_session_end_notice(speed=speed)
-        return 0
-    finally:
-        _clear_worker_pid_file(NOTICE_PID_FILE, expected_pid=os.getpid())
-
-
-def _restore_session_end_notice(*, speed: float) -> None:
-    with _state_lock():
-        if not _worker_pid_matches(NOTICE_PID_FILE, os.getpid()):
-            return
-
-        aggregate = _read_session_snapshot_unlocked()["aggregate"]
-        apply_signal_now(SIGNALS[aggregate], speed=speed)
+def _signal_duration(signal_to_render: AgentSignal, speed: float) -> float:
+    return sum(max(frame.seconds * max(speed, 0.05), 0.0) for frame in signal_to_render.frames) * signal_to_render.loops
 
 
 @contextmanager
@@ -290,105 +398,37 @@ def _prune_sessions(sessions: dict[str, object], now: float) -> None:
         updated_at = value.get("updated_at")
         if not isinstance(updated_at, (int, float)) or now - updated_at > SESSION_TTL_SECONDS:
             expired.append(session_key)
+            continue
+        signal_name = value.get("signal")
+        if "owner_pid" in value and value.get("owner_pid_source") != OWNER_PID_SOURCE:
+            if signal_name in WORKING_SIGNALS:
+                expired.append(session_key)
+                continue
+            value.pop("owner_pid", None)
+        if signal_name in WORKING_SIGNALS and now - updated_at > WORK_SESSION_STALE_SECONDS:
+            expired.append(session_key)
 
     for session_key in expired:
         sessions.pop(session_key, None)
 
 
-def start_worker(signal_name: str, *, speed: float = 1.0) -> None:
-    _spawn_worker_process(
-        signal_name=signal_name,
-        speed=speed,
-        pid_file=PID_FILE,
-        log_file=LOG_FILE,
-        verify_startup=True,
-    )
+def _prune_dead_owner_sessions(sessions: dict[str, object]) -> bool:
+    expired = []
+    for session_key, value in sessions.items():
+        if not isinstance(value, dict):
+            continue
+        if value.get("owner_pid_source") != OWNER_PID_SOURCE:
+            continue
+        owner_pid = value.get("owner_pid")
+        if isinstance(owner_pid, int) and owner_pid > 0 and not _is_running(owner_pid):
+            expired.append(session_key)
+
+    for session_key in expired:
+        sessions.pop(session_key, None)
+    return bool(expired)
 
 
-def stop_notice_worker() -> None:
-    _stop_worker_process(pid_file=NOTICE_PID_FILE, orphan_signal_names={SESSION_END_NOTICE_SIGNAL})
-
-
-def _worker_matches(signal_name: str) -> bool:
-    state = _read_worker_state(PID_FILE)
-    pid = state.get("pid")
-    return state.get("signal") == signal_name and isinstance(pid, int) and _is_running(pid)
-
-
-def _worker_pid_matches(pid_file: Path, expected_pid: int) -> bool:
-    return _read_worker_state(pid_file).get("pid") == expected_pid
-
-
-def _play_with_retries(signal: AgentSignal, *, speed: float) -> None:
-    last_error: SignalLightError | None = None
-    for _ in range(12):
-        try:
-            with SignalLight(LightMapping.from_env(os.environ)) as light:
-                signal.play(light, speed=speed)
-            return
-        except SignalLightError as exc:
-            last_error = exc
-            time.sleep(0.15)
-
-    raise last_error or SignalLightError("Failed to apply signal state.")
-
-
-def _spawn_worker_process(
-    *,
-    signal_name: str,
-    speed: float,
-    pid_file: Path,
-    log_file: Path,
-    verify_startup: bool = True,
-) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    command = [
-        sys.executable,
-        "-m",
-        "signal_light",
-        "worker",
-        "--owner-token",
-        _worker_owner_token(),
-        signal_name,
-        "--speed",
-        str(speed),
-    ]
-    log = log_file.open("ab")
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=log,
-            cwd=Path(__file__).resolve().parents[1],
-            env=os.environ.copy(),
-            start_new_session=True,
-        )
-    finally:
-        log.close()
-
-    pid_file.write_text(
-        json.dumps(
-            {
-                "pid": process.pid,
-                "signal": signal_name,
-                "owner_token": _worker_owner_token(),
-                "started_at": time.time(),
-            },
-            ensure_ascii=False,
-        )
-    )
-
-    if not verify_startup:
-        return
-
-    time.sleep(0.2)
-    if process.poll() is not None:
-        _clear_worker_pid_file(pid_file, expected_pid=process.pid)
-        raise SignalLightError(_worker_error_message(signal_name, log_file))
-
-
-def _worker_error_message(signal_name: str, log_file: Path) -> str:
+def _server_error_message(log_file: Path) -> str:
     detail = ""
     try:
         detail = log_file.read_text(errors="replace").strip().splitlines()[-1]
@@ -396,32 +436,361 @@ def _worker_error_message(signal_name: str, log_file: Path) -> str:
         pass
 
     if detail:
-        return f"Signal worker for {signal_name} exited immediately: {detail}"
-    return f"Signal worker for {signal_name} exited immediately."
+        return f"Signal server exited immediately: {detail}"
+    return "Signal server exited immediately."
 
 
-def stop_worker() -> None:
-    _stop_worker_process(pid_file=PID_FILE, orphan_signal_names=REPEATING_WORKER_SIGNALS)
+def _server_running() -> bool:
+    pid = _read_pid_file(SERVER_PID_FILE).get("pid")
+    return isinstance(pid, int) and pid > 0 and _is_running(pid) and _server_accepts_connections()
 
 
-def _stop_worker_process(*, pid_file: Path, orphan_signal_names: set[str]) -> None:
-    state = _read_worker_state(pid_file)
-    pid = state.get("pid")
-    stopped_pids: set[int] = set()
-    if isinstance(pid, int) and pid > 0 and pid != os.getpid():
-        _terminate(pid)
-        stopped_pids.add(pid)
+def _ensure_server_running() -> None:
+    if _server_running():
+        return
 
-    for orphan_pid in _find_worker_pids(orphan_signal_names):
-        if orphan_pid not in stopped_pids and orphan_pid != os.getpid():
-            _terminate(orphan_pid)
+    with _server_startup_lock():
+        if _server_running():
+            return
+        if _server_process_lock_is_held():
+            if _wait_for_running_server(timeout=3.0):
+                return
+            _stop_unreachable_server()
+            if _wait_for_server_lock_release(timeout=2.0) and _server_running():
+                return
+            if _server_process_lock_is_held():
+                raise SignalLightError("Signal server is starting but did not become reachable in time.")
 
-    _clear_worker_pid_file(pid_file)
+        _clear_pid_file(SERVER_PID_FILE)
+        _clear_server_ipc()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            "-m",
+            "signal_light",
+            "server",
+        ]
+        log = SERVER_LOG_FILE.open("ab")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                cwd=PROJECT_ROOT,
+                env=os.environ.copy(),
+                start_new_session=True,
+            )
+        finally:
+            log.close()
+
+        deadline = time.monotonic() + 3.0
+        process_exited = False
+        while time.monotonic() < deadline:
+            if _server_running():
+                return
+            if process.poll() is not None:
+                process_exited = True
+            time.sleep(0.05)
+
+        if process_exited:
+            raise SignalLightError(_server_error_message(SERVER_LOG_FILE))
+        _stop_process(process.pid)
+        _clear_pid_file(SERVER_PID_FILE, expected_pid=process.pid)
+        _clear_server_ipc()
+        raise SignalLightError("Signal server did not start in time.")
 
 
-def _clear_worker_pid_file(pid_file: Path, *, expected_pid: int | None = None) -> None:
+def _send_server_request(payload: dict[str, object], *, start_if_missing: bool = True) -> dict[str, object]:
+    if start_if_missing:
+        _ensure_server_running()
+    elif not _server_running():
+        raise SignalLightError("Signal server is not running.")
+
+    try:
+        return _send_server_request_once(payload)
+    except OSError:
+        if not start_if_missing:
+            raise SignalLightError("Signal server is not running.")
+        if not _stop_unreachable_server():
+            raise SignalLightError("Signal server is unreachable and could not be stopped.")
+        if not _wait_for_server_lock_release(timeout=2.0):
+            raise SignalLightError("Signal server is unreachable and still holding the server lock.")
+        _clear_pid_file(SERVER_PID_FILE)
+        _clear_server_ipc()
+        _ensure_server_running()
+        try:
+            return _send_server_request_once(payload)
+        except OSError as exc:
+            raise SignalLightError(f"Cannot reach signal server: {exc}") from exc
+
+
+def _server_accepts_connections() -> bool:
+    try:
+        _send_server_request_once({"action": "status"})
+    except Exception:
+        return False
+    return True
+
+
+def _send_server_request_once(payload: dict[str, object]) -> dict[str, object]:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SERVER_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    request_id = f"{os.getpid()}-{time.monotonic_ns()}-{uuid.uuid4().hex}"
+    request_path = SERVER_REQUEST_DIR / f"{request_id}.request.json"
+    response_path = SERVER_REQUEST_DIR / f"{request_id}.response.json"
+    request_tmp_path = request_path.with_suffix(".tmp")
+    request_tmp_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n")
+    request_tmp_path.replace(request_path)
+
+    deadline = time.monotonic() + SERVER_REQUEST_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            data = response_path.read_bytes()
+            response_path.unlink()
+            break
+        except FileNotFoundError:
+            time.sleep(min(SERVER_REQUEST_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    else:
+        try:
+            request_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise TimeoutError("Signal server did not respond in time.")
+
+    try:
+        response = json.loads(data.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        raise SignalLightError("Signal server returned invalid JSON.") from exc
+
+    if not isinstance(response, dict):
+        raise SignalLightError("Signal server returned an unexpected response.")
+    if response.get("ok") is False:
+        raise SignalLightError(str(response.get("error") or "Signal server request failed."))
+    return response
+
+
+def _handle_server_requests(display: ServerDisplay) -> None:
+    SERVER_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    for request_path in sorted(SERVER_REQUEST_DIR.glob("*.request.json")):
+        response_path = SERVER_REQUEST_DIR / request_path.name.replace(".request.json", ".response.json")
+        try:
+            request = json.loads(request_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        finally:
+            try:
+                request_path.unlink()
+            except FileNotFoundError:
+                pass
+
+        response = _handle_server_request(request, display)
+        response_tmp_path = response_path.with_suffix(".tmp")
+        response_tmp_path.write_text(json.dumps(response, ensure_ascii=False) + "\n")
+        response_tmp_path.replace(response_path)
+
+def _handle_server_request(request: object, display: ServerDisplay) -> dict[str, object]:
+    if not isinstance(request, dict):
+        return {"ok": False, "error": "Invalid request payload."}
+
+    action = request.get("action")
+    try:
+        if action == "status":
+            snapshot = read_display_snapshot()
+            return {"ok": True, **snapshot}
+
+        if action == "direct_signal":
+            signal_name = request.get("signal_name")
+            speed = float(request.get("speed", 1.0))
+            if not isinstance(signal_name, str) or signal_name not in SIGNALS:
+                return {"ok": False, "error": "Unknown direct signal."}
+            snapshot = update_direct_signal(signal_name)
+            display.set_aggregate(str(snapshot["display_signal"]), speed=speed)
+            return {"ok": True, "signal": signal_name, **snapshot}
+
+        if action == "session_signal":
+            session_key = request.get("session_key")
+            signal_name = request.get("signal_name")
+            owner_pid = request.get("owner_pid")
+            speed = float(request.get("speed", 1.0))
+            if not isinstance(session_key, str) or not session_key:
+                return {"ok": False, "error": "Missing session key."}
+            if not isinstance(signal_name, str):
+                return {"ok": False, "error": "Missing signal name."}
+            result = update_session_signal(
+                session_key,
+                signal_name,
+                owner_pid=owner_pid if isinstance(owner_pid, int) else None,
+            )
+            aggregate = str(result["aggregate"])
+            display.set_aggregate(aggregate, show_notice=bool(result["show_notice"]), speed=speed)
+            snapshot = read_session_snapshot()
+            return {"ok": True, "aggregate": aggregate, **snapshot}
+    except SignalLightError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    return {"ok": False, "error": f"Unsupported action: {action}"}
+
+
+def _reconcile_server_sessions() -> dict[str, object]:
+    with _state_lock():
+        state = _read_session_state()
+        sessions = state.setdefault("sessions", {})
+        before = json.dumps(sessions, sort_keys=True, ensure_ascii=False)
+        now = time.time()
+        _prune_sessions(sessions, now)
+        changed = _prune_dead_owner_sessions(sessions)
+        changed = changed or before != json.dumps(sessions, sort_keys=True, ensure_ascii=False)
+        snapshot = _read_display_snapshot_from_state(state)
+        if changed:
+            _write_session_state(state)
+    return {
+        "changed": changed,
+        "aggregate": snapshot["display_signal"],
+    }
+
+
+@contextmanager
+def _server_process_lock() -> Iterator[object]:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_file = SERVER_LOCK_FILE.open("a+")
+    try:
+        import fcntl
+
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SignalLightError("Signal server is already running.") from exc
+        yield lock_file
+    finally:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_file.close()
+
+
+@contextmanager
+def _server_startup_lock() -> Iterator[object]:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with SERVER_STARTUP_LOCK_FILE.open("a+") as lock_file:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            yield lock_file
+        finally:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def _server_process_lock_is_held() -> bool:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with SERVER_LOCK_FILE.open("a+") as lock_file:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+        except Exception:
+            pass
+    return False
+
+
+def _wait_for_running_server(*, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _server_running():
+            return True
+        time.sleep(0.05)
+    return _server_running()
+
+
+def _wait_for_server_lock_release(*, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _server_process_lock_is_held():
+            return True
+        time.sleep(0.05)
+    return not _server_process_lock_is_held()
+
+
+def _stop_unreachable_server() -> bool:
+    pid = _read_pid_file(SERVER_PID_FILE).get("pid")
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return False
+    if not _is_running(pid):
+        _clear_pid_file(SERVER_PID_FILE)
+        _clear_server_ipc()
+        return True
+
+    return _stop_process(pid)
+
+
+def _stop_process(pid: int) -> bool:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return _wait_for_process_exit(pid, timeout=1.0)
+
+
+def _wait_for_process_exit(pid: int, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _is_running(pid):
+            return True
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _is_running(pid):
+            return True
+        time.sleep(0.05)
+    return not _is_running(pid)
+
+
+def _prepare_server_ipc() -> None:
+    _clear_server_socket()
+    SERVER_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    for path in SERVER_REQUEST_DIR.glob("*.response.json"):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _clear_server_ipc() -> None:
+    _clear_server_socket()
+    for path in SERVER_REQUEST_DIR.glob("*.request.json"):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _clear_server_socket() -> None:
+    try:
+        SERVER_SOCKET_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _clear_pid_file(pid_file: Path, *, expected_pid: int | None = None) -> None:
     if expected_pid is not None:
-        state = _read_worker_state(pid_file)
+        state = _read_pid_file(pid_file)
         if state.get("pid") != expected_pid:
             return
 
@@ -431,120 +800,11 @@ def _clear_worker_pid_file(pid_file: Path, *, expected_pid: int | None = None) -
         pass
 
 
-def _read_worker_state(pid_file: Path) -> dict[str, object]:
+def _read_pid_file(pid_file: Path) -> dict[str, object]:
     try:
         return json.loads(pid_file.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
-
-
-def _find_worker_pids(signal_names: set[str]) -> list[int]:
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return []
-
-    if result.returncode != 0:
-        return []
-
-    pids: list[int] = []
-    for line in result.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        parts = stripped.split(None, 1)
-        if len(parts) != 2:
-            continue
-        pid_text, command = parts
-        try:
-            pid = int(pid_text)
-        except ValueError:
-            continue
-
-        if pid != os.getpid() and _is_worker_command(command, signal_names):
-            pids.append(pid)
-
-    return pids
-
-
-def _is_worker_command(command: str, signal_names: set[str]) -> bool:
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        parts = command.split()
-
-    for index in range(len(parts) - 2):
-        if parts[index : index + 3] != ["-m", "signal_light", "worker"]:
-            continue
-
-        worker_args = parts[index + 3 :]
-        if _option_value(worker_args, "--owner-token") != _worker_owner_token():
-            continue
-
-        if _worker_signal_from_args(worker_args) in signal_names:
-            return True
-    return False
-
-
-def _worker_owner_token() -> str:
-    identity = f"{PROJECT_ROOT}|{STATE_DIR.expanduser().resolve()}"
-    return sha256(identity.encode("utf-8")).hexdigest()[:16]
-
-
-def _option_value(args: list[str], option: str) -> str | None:
-    prefix = f"{option}="
-    for index, arg in enumerate(args):
-        if arg == option and index + 1 < len(args):
-            return args[index + 1]
-        if arg.startswith(prefix):
-            return arg.removeprefix(prefix)
-    return None
-
-
-def _worker_signal_from_args(args: list[str]) -> str | None:
-    skip_next = False
-    for arg in args:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg in {"--owner-token", "--speed"}:
-            skip_next = True
-            continue
-        if arg.startswith("--owner-token=") or arg.startswith("--speed="):
-            continue
-        if not arg.startswith("-"):
-            return arg
-    return None
-
-
-def _terminate(pid: int) -> None:
-    if not _is_running(pid):
-        return
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except PermissionError as exc:
-        raise SignalLightError(f"Cannot stop existing signal worker {pid}: {exc}") from exc
-
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        if not _is_running(pid):
-            return
-        time.sleep(0.05)
-
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    except PermissionError as exc:
-        raise SignalLightError(f"Cannot stop existing signal worker {pid}: {exc}") from exc
 
 
 def _is_running(pid: int) -> bool:

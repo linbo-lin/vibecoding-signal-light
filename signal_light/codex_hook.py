@@ -78,6 +78,19 @@ def choose_signal(hook_input: CodexHookInput) -> str:
 
 
 def session_key(hook_input: CodexHookInput, environ: Mapping[str, str]) -> str:
+    turn_id = _first_string(hook_input.payload, ("turn_id", "request_id"))
+    if turn_id:
+        return f"turn:{turn_id.strip()}"
+
+    nested_turn_id = _find_nested_string(hook_input.payload, ("turn_id", "request_id"))
+    if nested_turn_id:
+        return f"turn:{nested_turn_id}"
+
+    for key in ("CODEX_TURN_ID", "CODEX_REQUEST_ID"):
+        value = environ.get(key)
+        if value:
+            return f"turn:{value.strip()}"
+
     explicit = _first_string(
         hook_input.payload,
         (
@@ -220,11 +233,12 @@ def main() -> int:
     signal = choose_signal(hook_input)
     key = session_key(hook_input, os.environ)
 
-    from signal_light.cli import play_hook_signal
+    from signal_light.cli import play_hook_signal, resolve_hook_owner_pid
 
     return play_hook_signal(
         signal_name=signal,
         session_key=key,
+        owner_pid=resolve_hook_owner_pid(hook_input.payload, os.environ),
         dry_run=os.environ.get("SIGNAL_LIGHT_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"},
         quiet=True,
     )
