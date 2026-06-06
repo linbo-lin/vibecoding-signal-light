@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export SIGNAL_LIGHT_NO_HARDWARE="${SIGNAL_LIGHT_NO_HARDWARE:-1}"
+export SIGNAL_LIGHT_NO_HARDWARE=1
 export UV_CACHE_DIR="${SIGNAL_LIGHT_UV_CACHE_DIR:-/private/tmp/signal-light-uv-cache}"
 export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 
@@ -21,4 +21,4 @@ else
   PYTHON="python3"
 fi
 
-exec $PYTHON -m signal_light claude-code-hook "$@"
+exec $PYTHON -m signal_light desktop "$@"

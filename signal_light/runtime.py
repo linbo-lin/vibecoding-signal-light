@@ -31,8 +31,8 @@ LOCK_FILE = STATE_DIR / "state.lock"
 SESSION_TTL_SECONDS = int(os.environ.get("SIGNAL_LIGHT_SESSION_TTL_SECONDS", "86400"))
 IDLE_SLEEP_SECONDS = int(os.environ.get("SIGNAL_LIGHT_IDLE_SLEEP_SECONDS", "600"))
 
-RED_SIGNALS = {"blocked"}
-YELLOW_SIGNALS = {"permission", "attention", "done"}
+RED_SIGNALS = {"blocked", "permission"}
+YELLOW_SIGNALS = {"attention", "done"}
 WORKING_SIGNALS = {"thinking", "working", "tool_done"}
 SESSION_END_SIGNALS = {"session_end"}
 # Explicit clears should not look like session-completion cues.
@@ -42,10 +42,18 @@ IDLE_SLEEP_SIGNAL = "idle_sleep"
 TURN_END_SIGNALS = {"turn_end"}
 # Sessions still waiting for user action should survive turn_end.
 TURN_END_KEEP_SIGNALS = {"permission", "blocked"}
+# Notification should not mask a pending permission request.
+ATTENTION_WEAK_SIGNALS = {"attention"}
 REPEATING_WORKER_SIGNALS = {name for name, agent_signal in SIGNALS.items() if agent_signal.repeat}
 
 
+def _is_no_hardware() -> bool:
+    return os.environ.get("SIGNAL_LIGHT_NO_HARDWARE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def apply_signal(signal: AgentSignal, *, speed: float = 1.0) -> None:
+    if _is_no_hardware():
+        return
     """Apply a signal as the current persistent status."""
     stop_notice_worker()
     stop_sleep_worker()
@@ -64,6 +72,8 @@ def apply_signal(signal: AgentSignal, *, speed: float = 1.0) -> None:
 
 def apply_signal_now(signal: AgentSignal, *, speed: float = 1.0) -> None:
     """Apply a signal without stopping any in-flight notice worker."""
+    if _is_no_hardware():
+        return
     stop_sleep_worker()
     if signal.repeat:
         if _worker_matches(signal.name):
@@ -95,14 +105,21 @@ def apply_session_signal(session_key: str, signal_name: str, *, speed: float = 1
         elif signal_name in TURN_END_SIGNALS:
             current = sessions.get(session_key)
             current_signal = current.get("signal") if isinstance(current, dict) else None
-            if current_signal not in TURN_END_KEEP_SIGNALS:
-                should_show_session_end_notice = session_key in sessions
-                sessions.pop(session_key, None)
+            if current_signal in TURN_END_KEEP_SIGNALS:
+                pass  # keep blocked/permission state, user hasn't responded yet
+            else:
+                sessions[session_key] = {"signal": "idle", "updated_at": now}
         else:
-            sessions[session_key] = {
-                "signal": signal_name,
-                "updated_at": now,
-            }
+            current = sessions.get(session_key)
+            current_signal = current.get("signal") if isinstance(current, dict) else None
+            # Notification should not mask idle or pending permission/blocked request
+            if current_signal in (*TURN_END_KEEP_SIGNALS, "idle") and signal_name in ATTENTION_WEAK_SIGNALS:
+                pass
+            else:
+                sessions[session_key] = {
+                    "signal": signal_name,
+                    "updated_at": now,
+                }
 
         aggregate = aggregate_sessions(sessions)
         _write_session_state(state)
@@ -179,10 +196,10 @@ def aggregate_sessions(sessions: dict[str, object]) -> str:
             if isinstance(signal_name, str):
                 signals.append(signal_name)
 
-    if any(signal_name in RED_SIGNALS for signal_name in signals):
-        return "blocked"
     if any(signal_name == "permission" for signal_name in signals):
         return "permission"
+    if any(signal_name in RED_SIGNALS for signal_name in signals):
+        return "blocked"
     if any(signal_name in YELLOW_SIGNALS for signal_name in signals):
         return "attention"
     if any(signal_name in WORKING_SIGNALS for signal_name in signals):
@@ -330,6 +347,8 @@ def _play_with_retries(signal: AgentSignal, *, speed: float) -> None:
             last_error = exc
             time.sleep(0.15)
 
+    if _is_no_hardware():
+        return
     raise last_error or SignalLightError("Failed to apply signal state.")
 
 
@@ -385,6 +404,8 @@ def _spawn_worker_process(
     time.sleep(0.2)
     if process.poll() is not None:
         _clear_worker_pid_file(pid_file, expected_pid=process.pid)
+        if _is_no_hardware():
+            return
         raise SignalLightError(_worker_error_message(signal_name, log_file))
 
 

@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from signal_light.agent_signals import SIGNALS, AgentSignal, Frame
@@ -86,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--owner-token", help=argparse.SUPPRESS)
     worker.add_argument("--speed", type=float, default=1.0)
 
+    desktop = subparsers.add_parser("desktop", help="start the desktop floating traffic-light window")
+    desktop.add_argument("--status", action="store_true", help="print current session state and exit")
+
     test = subparsers.add_parser("test", help="run a quick red/yellow/green hardware test")
     test.add_argument("--dry-run", action="store_true", help="print GPIO states instead of touching hardware")
 
@@ -135,6 +139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "status":
         print(json.dumps(read_session_snapshot(), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "desktop":
+        return run_desktop(status_only=args.status)
     if args.command == "test":
         return run_test(dry_run=args.dry_run)
     if args.command == "worker":
@@ -243,6 +249,70 @@ def run_test(*, dry_run: bool = False) -> int:
     except SignalLightError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    return 0
+
+
+DESKTOP_PID_FILE = Path("/private/tmp/signal-light/desktop.pid")
+
+
+def _desktop_already_running() -> bool:
+    if not DESKTOP_PID_FILE.exists():
+        return False
+    try:
+        pid = int(DESKTOP_PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def run_desktop(*, status_only: bool = False) -> int:
+    from signal_light.desktop_ui import DesktopSignalWindow
+    from signal_light.desktop_monitor import (
+        DesktopMonitor, _read_sessions, _read_session_names,
+        aggregate_sessions, bootstrap_existing_sessions,
+    )
+
+    if status_only:
+        sessions = _read_sessions()
+        aggregate = aggregate_sessions(sessions)
+        print(json.dumps({
+            "aggregate": aggregate,
+            "sessions": sessions,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    if _desktop_already_running():
+        print("信号灯已在运行中", file=sys.stderr)
+        return 0
+
+    DESKTOP_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DESKTOP_PID_FILE.write_text(str(os.getpid()))
+
+    try:
+        bootstrap_existing_sessions()
+
+        window = DesktopSignalWindow()
+        monitor = DesktopMonitor(window)
+
+        sessions = _read_sessions()
+        names = _read_session_names()
+        aggregate = aggregate_sessions(sessions)
+        window.update_state(aggregate, sessions, names)
+        monitor.start()
+
+        window.mainloop()
+    finally:
+        try:
+            DESKTOP_PID_FILE.unlink()
+        except FileNotFoundError:
+            pass
 
     return 0
 
