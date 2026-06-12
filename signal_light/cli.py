@@ -87,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--owner-token", help=argparse.SUPPRESS)
     worker.add_argument("--speed", type=float, default=1.0)
 
+    menu_bar = subparsers.add_parser("menu-bar", help="start the macOS menu bar status indicator")
+    menu_bar.add_argument("--status", action="store_true", help="print current session state and exit")
+
     desktop = subparsers.add_parser("desktop", help="start the desktop floating traffic-light window")
     desktop.add_argument("--status", action="store_true", help="print current session state and exit")
 
@@ -139,6 +142,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "status":
         print(json.dumps(read_session_snapshot(), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "menu-bar":
+        return run_menu_bar(status_only=args.status)
     if args.command == "desktop":
         return run_desktop(status_only=args.status)
     if args.command == "test":
@@ -253,14 +258,15 @@ def run_test(*, dry_run: bool = False) -> int:
     return 0
 
 
+MENU_BAR_PID_FILE = Path("/private/tmp/signal-light/menu-bar.pid")
 DESKTOP_PID_FILE = Path("/private/tmp/signal-light/desktop.pid")
 
 
-def _desktop_already_running() -> bool:
-    if not DESKTOP_PID_FILE.exists():
+def _pid_file_already_running(pid_file: Path) -> bool:
+    if not pid_file.exists():
         return False
     try:
-        pid = int(DESKTOP_PID_FILE.read_text().strip())
+        pid = int(pid_file.read_text().strip())
     except (ValueError, OSError):
         return False
     try:
@@ -270,6 +276,38 @@ def _desktop_already_running() -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _desktop_already_running() -> bool:
+    return _pid_file_already_running(DESKTOP_PID_FILE)
+
+
+def run_menu_bar(*, status_only: bool = False) -> int:
+    from signal_light.menu_bar import run as run_menu_bar_app
+    from signal_light.desktop_monitor import _read_sessions, _read_session_names, aggregate_sessions
+
+    if status_only:
+        sessions = _read_sessions()
+        aggregate = aggregate_sessions(sessions)
+        print(json.dumps({"aggregate": aggregate, "sessions": sessions}, ensure_ascii=False, indent=2))
+        return 0
+
+    if _pid_file_already_running(MENU_BAR_PID_FILE):
+        print("状态栏信号灯已在运行中", file=sys.stderr)
+        return 0
+
+    MENU_BAR_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MENU_BAR_PID_FILE.write_text(str(os.getpid()))
+
+    try:
+        run_menu_bar_app()
+    finally:
+        try:
+            MENU_BAR_PID_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+    return 0
 
 
 def run_desktop(*, status_only: bool = False) -> int:

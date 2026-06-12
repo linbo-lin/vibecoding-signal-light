@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "EasyMCP2221>=1.8.0",
+    "rumps>=0.4.0",
 ]
 
 [dependency-groups]
